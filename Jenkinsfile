@@ -10,15 +10,12 @@ pipeline {
     stages {
         stage('copyBuild') {
             steps {
-                sh 'echo "Hello world!"'
-                //sh(label: "docker build", script: "docker build -t $LOCAL_DOCKER_IMAGE .")
-                build_image = docker.image('dkadam07/mytest')
-                docker.withRegistry(params.REGISTRY_URL, params.CREDENTIALS_ID) {
-                    build_image.push()
+                script {
+                    build_image = docker.image('dkadam07/mytest')
+                    docker.withRegistry(params.REGISTRY_URL, params.CREDENTIALS_ID) {
+                        build_image.push()
+                    }
                 }
-                // pushToRegistry(ODYSSEY_DOCKER_REGISTRY, ODYSSEY_DOCKER_CREDS_USR, ODYSSEY_DOCKER_CREDS_PSW,
-                //     LOCAL_DOCKER_IMAGE, "$ODYSSEY_DOCKER_REGISTRY/$REMOTE_DOCKER_IMAGE:$BUILD_ID" )
-                // sh(label: "remove local image", script: "docker rmi ${LOCAL_DOCKER_IMAGE}")
             }
         }
     }
