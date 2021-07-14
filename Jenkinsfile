@@ -2,7 +2,7 @@ pipeline {
     agent any
 
     parameters {
-        string(name: 'REGISTRY_URL', defaultValue: 'https://registry.hub.docker.com', description: 'URL of registry')
+        string(name: 'REGISTRY_URL', defaultValue: 'registry.hub.docker.com', description: 'URL of registry')
         string(name: 'USER_NAME', defaultValue: 'admin', description: 'registry user name')
         string(name: 'CREDENTIALS_ID', defaultValue: 'docker-creds', description: 'credentials for docker login')
     }
@@ -13,7 +13,8 @@ pipeline {
                 script {
                     //build_image = docker.image('dkadam07/mytest')
                     docker.withRegistry(params.REGISTRY_URL, params.CREDENTIALS_ID) {
-                        sh "docker push dkadam07/mytest:latest"
+                        //sh "docker push dkadam07/mytest:latest"
+                        sh 'echo "Hello world!"'
                     }
                 }
             }
