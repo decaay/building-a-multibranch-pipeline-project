@@ -7,10 +7,6 @@ pipeline {
         string(name: 'CREDENTIALS_ID', defaultValue: 'docker-creds', description: 'credentials for docker login')
     }
 
-    environment {
-        registry = params.
-    }
-
     stages {
         stage('copyBuild') {
             steps {
