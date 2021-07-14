@@ -12,7 +12,7 @@ pipeline {
             steps {
                 script {
                     //build_image = docker.image('dkadam07/mytest')
-                    docker.withRegistry(params.REGISTRY_URL, params.CREDENTIALS_ID) {
+                    docker.withRegistry("docker.io", "docker-creds") {
                         //sh "docker push dkadam07/mytest:latest"
                         sh 'echo "Hello world!"'
                     }
