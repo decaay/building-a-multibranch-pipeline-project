@@ -1,0 +1,199 @@
+pipeline {
+    agent none
+
+     parameters {
+        choice(name: 'ENV', choices: ['dev', 'qa'], description: 'Destination ACR environment')
+        choice(name: 'TARGET', choices: ['argo', 'aro'], description: 'Destination ACR environment')
+        string(name: 'DOCKER_REPO', defaultValue: 'com/csg/ib/cts/proplng/images/test', description: 'Docker repo path') //com/csg/ib/cts/proplng/images/test
+        string(name: 'IMAGE_NAME_AND_TAG', defaultValue: 'uibaseapparo:5', description: 'Docker image name and TAG')
+        string(name: 'OC_TOKEN_NAME', defaultValue: 'alex-argo-test-token', description: '')         //alex-aro-test-token
+        string(name: 'HELM_DEPLOYMENT_NAME', defaultValue: 'ui-base-app-alex', description: '')
+        string(name: 'HELM_CHART_NAME', defaultValue: 'ui-base-app', description: 'chart')
+        string(name: 'HELM_CUSTOM_CMD', defaultValue: '', description: 'like --set-string someVariable=someValue')
+    }
+
+
+     environment {
+        PROCEED =  "${env.BRANCH_NAME == 'develop' ? true : false}"
+        EMAIL_NOTIFICATION="alexander.ignatov@credit-suisse.com"
+        ARO_SERVER =  "https://api.aro${params.ENV}01.proplng.azure.hedani.net:6443"
+        ARGO_SERVER = "https://ocp-3-gb-slo-devit.caas.csintra.net:443"//getArgoServer("${params.ENV}")
+        HELM_REPO_NAME = getHelmRepo("${params.ENV}")
+        HELM_REPO_URL = "https://odyssey.apps.csintra.net/docker/${HELM_REPO_NAME}"
+        ACR_REGISTRY = "proplng${params.ENV}acr.azurecr.io"
+        ACR_COPY_PIPELINE = 'PROPLNG/PROPLNG-P/PROPLNG-PL-BP/imagecopytoacr-pipeline/develop'
+        OC_TOKEN= credentials("${OC_TOKEN_NAME}")
+        ACR_REGISTRY_LOGIN = "proplng${params.ENV}acr"
+        ACR_REGISTRY_TOKEN = credentials("proplng${params.ENV}acr-token")
+        ODYSSEY_REGISTRY = getOdysseyRegistry("${params.ENV}")
+        ODYSSEY_REGISTRY_CRED = credentials("s206824-cred")
+    }
+
+    options {
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Git branch check') {
+            agent {
+                label 'docker'
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            steps {
+                script {
+                    echo("ARGO_SERVER: $ARGO_SERVER" )
+                    echo("HELM_REPO_NAME: $HELM_REPO_NAME" )
+                    if(!PROCEED) {
+                        echo('Aborting the build')
+                        currentBuild.result = 'ABORTED'
+                        error('Branch not configured')
+                    }
+                    echo sh(script: 'env|sort', returnStdout: true)
+                }
+            }
+        }
+        stage('Promote Odyssey image from QA to UAT') {
+            when {
+                expression { env == "uat" }
+            }
+            agent {
+                label 'docker'
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            steps {
+                echo "--- Promote Odyssey image from QA to UAT ---"
+                sh(label: "docker login", script: 'docker login -u ${ODYSSEY_REGISTRY_CRED_USR} -p ${ODYSSEY_REGISTRY_CRED_PSW} ${ODYSSEY_REGISTRY}')
+                sh(label: "docker login", script: 'docker login -u ${ODYSSEY_REGISTRY_CRED_USR} -p ${ODYSSEY_REGISTRY_CRED_PSW} ${getOdysseyRegistry("dev")}')
+                sh(label: "docker tag", script: 'docker tag ${getOdysseyRegistry("dev")}/${DOCKER_REPO}/${IMAGE_NAME_AND_TAG} ${ODYSSEY_REGISTRY}/${DOCKER_REPO}/${IMAGE_NAME_AND_TAG}')
+                sh(label: "docker push", script: 'docker push ${ODYSSEY_REGISTRY}/${DOCKER_REPO}/${IMAGE_NAME_AND_TAG}')
+                sh(label: "docker logout", script: 'docker logout ${ODYSSEY_REGISTRY}')
+                sh(label: "docker logout", script: 'docker logout ${getOdysseyRegistry("dev")}')
+            }
+        }
+        stage('Deploy to ARGO') {
+            when {
+                expression { params.TARGET == "argo" }
+            }
+            agent {
+                docker {
+                    image 'com/csg/em/operational/oc-cli-helm:1.0.7'
+                    label 'docker'
+                    args "--user root"
+                }
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            steps {
+                echo "--- Deploying to ARGO ---"
+                deployToOc("$ARGO_SERVER", "$ODYSSEY_REGISTRY/$IMAGE_NAME_AND_TAG")
+            }
+        }
+        stage('Copy image to ACR') {
+            when {
+                expression { params.TARGET == "aro" }
+            }
+            agent {
+                label 'docker'
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            steps {
+                echo "---= Copy image to ACR =---"
+                build job: "$ACR_COPY_PIPELINE", parameters: [
+                    [$class: 'StringParameterValue', name: 'ENV', value: "$params.ENV"],
+                    [$class: 'StringParameterValue', name: 'DOCKER_REPO', value: "$params.DOCKER_REPO"],
+                    [$class: 'StringParameterValue', name: 'IMAGE_NAME_AND_TAG', value: "$params.IMAGE_NAME_AND_TAG"]
+                    ]
+                echo "--- image $params.DOCKER_REPO/$params.IMAGE_NAME_AND_TAG copyed from $ODYSSEY_REGISTRY to $ACR_REGISTRY/$params.DOCKER_REPO/$IMAGE_NAME_AND_TAG ---"
+                echo "--- ACR image: $ACR_REGISTRY/$params.DOCKER_REPO/$params.IMAGE_NAME_AND_TAG ---"
+            }
+        }
+        stage('Deploy to ARO') {
+            when {
+                expression { params.TARGET == "aro" }
+            }
+            agent {
+                docker {
+                    image 'com/csg/em/operational/oc-cli-helm:1.0.7'
+                    label 'docker'
+                    args "--user root"
+                }
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            steps {
+                echo "--- Deploying to ARO ---"
+                deployToOc("$ARO_SERVER","$ACR_REGISTRY/$IMAGE_NAME_AND_TAG")
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                if(PROCEED.toBoolean()) {
+                    BUILD_STATUS = currentBuild.currentResult
+                    emailext subject: '${BUILD_STATUS} - $DEFAULT_SUBJECT', //just prefixing with status in front so it's easier to see
+                        body: '$DEFAULT_CONTENT',
+                        replyTo: '$DEFAULT_REPLYTO',
+                        to: EMAIL_NOTIFICATION
+                }
+            }
+        }
+    }
+
+}
+
+def deployToOc(String argoUrl, String imageName) {
+    sh(label: "oc version", script: "oc version")
+    sh(label: "oc login", script: "oc login ${argoUrl} --token=$OC_TOKEN --insecure-skip-tls-verify=true")
+    sh(label: "helm version", script: "helm version")
+    sh(label: "helm add repo", script: "helm repo add helm-dev $HELM_REPO_URL --username $ODYSSEY_REGISTRY_CRED_USR --password $ODYSSEY_REGISTRY_CRED_PSW")
+    sh(label: "Update helm repo", script: "helm repo update")
+    sh(label: "helm deployment", script: "helm upgrade --install $HELM_DEPLOYMENT_NAME $HELM_REPO_NAME/$HELM_CHART_NAME --set imageName=${imageName}")
+    sh(label: "oc logout", script: "oc logout")
+}
+def getOdysseyRegistry(String envir) {
+        if ((envir == 'dev') || ($envir == 'qa')) {
+            return "docker-dev.odyssey.apps.csintra.net"
+        } else {
+            return "docker.odyssey.apps.csintra.net"
+         }
+}
+def getHelmRepo(String envir) {
+        if ((envir == 'dev') || (envir == 'qa')) {
+            return "helm-dev"
+        } else {
+            return "helm"
+         }
+}
+def getArgoServer(String envir) {
+        if ((envir == 'dev') || (envir == 'qa')) {
+            return "https://ocp-3-us-pri-devit.caas.csintra.net:443"
+        }
+        if ((envir == 'uat') || (envir == 'prod')) {
+            return "https://ocp-3-us-pri-uatprod.caas.csintra.net:443"
+        }
+        else {
+            return "https://ocp-3-us-cdc-uatprod.caas.csintra.net:443"
+        }
+}
+/*
+pipeline {
+    agent any
+    stages {
+        stage('VERIFY RFC') {
+            steps {
+                verifyRFC RFCNumber:'RFC6934142'
+            }
+        }
+    }
+}
+*/

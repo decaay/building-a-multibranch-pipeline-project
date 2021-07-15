@@ -1,0 +1,56 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'ARO_URL', defaultValue: '', description: 'URL of ARO')
+        string(name: 'HELM_REPO_URL', defaultValue: '', description: 'URL for HELM repo')
+        string(name: 'HELM_REPO_NAME', defaultValue: '', description: 'HELM repo name')
+        string(name: 'HELM_CHART', defaultValue: '', description: 'HELM chart name')
+        string(name: 'HELM_CHART_VER', defaultValue: '', description: 'HELM chart version')
+        string(name: 'USER_NAME', defaultValue: 'admin', description: 'registry user name')
+        string(name: 'ENVIRONMENT', defaultValue: 'dev', description: 'Environment name')
+        string(name: 'ARGO_VALUES_FILENAME', defaultValue: 'argo_values.yaml', description: 'Argo values file name')
+        string(name: 'DOCKER_CREDENTIALS_ID', defaultValue: 'docker-creds', description: 'credentials for docker login')
+        string(name: 'ARO_TOKEN_ID', defaultValue: 'docker-creds', description: 'token for aro')
+        string(name: 'ACR_IMAGE_URI', defaultValue: '', description: 'ACR image uri')
+    }
+
+    environment {
+        TEMP_DIR = '/tmp/chart'
+        CHART_DIR = '${TEMP_DIR}/${HELM_CHART}'
+        CREDENTIALS = credentials("${params.DOCKER_CREDENTIALS_ID}")
+        ARO_TOKEN = credentials("${params.ARO_TOKEN_ID}")
+        VALUES_OVERRIDE = "${CHART_DIR}/overrides/${ENVIRONMENT}/${ARGO_VALUES_FILENAME}"
+    }
+
+    stages {
+        stage('deploy') {
+            agent {
+                docker {
+                    image 'com/csg/em/operational/oc-cli-helm:1.0.7'
+                    label 'docker'
+                    args "--user root"
+                }
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            steps {
+                script {
+                    sh "oc version"
+                    sh "oc login ${ARO_URL} --token=${ARO_TOKEN} --insecure-skip-tls-verify=true"
+                    sh "helm version"
+                    sh "helm repo add helm-dev ${HELM_REPO_URL} --username ${CREDENTIALS_USR} --password ${CREDENTIALS_PSW}"
+                    sh "helm repo update"
+                    sh "mkdir ${TEMP_DIR}"
+                    sh "helm pull ${HELM_REPO_NAME}/${HELM_CHART} --version ${HELM_CHART_VER} -d ${TEMP_DIR} --untar"   
+                    sh "ls -l ${TEMP_DIR}/${HELM_CHART}"
+                    sh "helm upgrade --install ${ARO_HELM_RELEASE} ${CHART_DIR} -f ${VALUES_OVERRIDE} -f overrides/aro-overrides.yaml --version ${HELM_CHART_VER} --set image=${ACR_IMAGE_URI}"
+                    sh "oc logout"
+                    sh "rm -r ${TEMP_DIR}"
+                    sh "rm -r *"
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,35 @@
+stage('Push Image to ACR') {
+            agent {
+                docker {
+                    image 'com/csg/dts/jenkins/jenkins-skopeo:1.1.2'
+                    label 'docker'
+                    args "--user root"
+                }
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            steps {
+                script {
+                    echo "--- Pushing image $ODYSSEY_DOCKER_REGISTRY/$REMOTE_DOCKER_IMAGE to $ACR_REGISTRY ---"
+
+
+                    sh(label: "add acr login entry to hosts file", script: "echo ‘10.32.71.136 proplngdevacr.azurecr.io' >> /etc/hosts")
+                    sh(label: "add acr data entry to hosts file", script: "echo ‘10.32.71.135 proplngdevacr.eastus2.data.azurecr.io' >> /etc/hosts")
+
+                    copyDockerImage(image: REMOTE_DOCKER_IMAGE,
+                        src: ODYSSEY_DOCKER_REGISTRY,
+                        dest: ACR_REGISTRY,
+                        tag: BUILD_ID,
+                        latest: true,
+                        srcUsr: ODYSSEY_DOCKER_CREDS_USR,
+                        srcPsw: ODYSSEY_DOCKER_CREDS_PSW,
+                        destUsr: ACR_CREDS_USR,
+                        destPsw: ACR_CREDS_PSW
+                    )
+                }
+            }
+        }
+
+copyDockerImage
+skopeo copy '--src-creds=${user}:${pass}' '--dest-creds=${userACR}:${passACR}' docker://${odysseyImagePath} docker://${acrImage}:${buildNumber}")

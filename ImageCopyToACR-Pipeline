@@ -1,0 +1,96 @@
+pipeline {
+    agent none
+
+     parameters {
+        choice(name: 'ENV', choices: ['dev', 'qa'], description: 'Destination ACR environment')
+        string(name: 'DOCKER_REPO', defaultValue: 'com/csg/ib/cts/proplng', description: 'Docker repo path')
+        string(name: 'IMAGE_NAME_AND_TAG', defaultValue: 'redis:1.0', description: 'Docker image name and TAG')
+    }
+
+     environment {
+        PROCEED =  "${env.BRANCH_NAME == 'develop' ? true : false}"
+        EMAIL_NOTIFICATION="alexander.ignatov@credit-suisse.com"
+        ACR_REGISTRY = "proplng${params.ENV}acr.azurecr.io"
+        ACR_REGISTRY_LOGIN = "proplng${params.ENV}acr"
+        ACR_REGISTRY_TOKEN = credentials("proplng${params.ENV}acr-token")
+        ODYSSEY_REGISTRY = getODYSSEY_REGISTRY()
+        ODYSSEY_REGISTRY_CRED = credentials("s206824-cred")
+        //ACR_HOST1="'10.32.71.136 proplngdevacr.azurecr.io'"
+        //ACR_HOST2="'10.32.71.135 proplngdevacr.eastus2.data.azurecr.io'"
+    }
+
+    options {
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Git branch check') {
+            agent {
+                label 'docker'
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            steps {
+                script {
+                    if(!PROCEED) {
+                        echo('Aborting the build')
+                        currentBuild.result = 'ABORTED'
+                        error('Branch not configured')
+                    }
+                    echo sh(script: 'env|sort', returnStdout: true)
+                }
+            }
+        }
+
+        stage('Copy to ACR') {
+            agent {
+                label 'docker'
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            steps {
+                echo "----start of copy to ACR----"
+                echo "----running skopeo docker image----"
+                sh(label: "docker run", script: "docker run docker-dev.odyssey.apps.csintra.net/com/csg/dts/jenkins/jenkins-skopeo:1.1.2 /bin/sh")
+                //sh(label: "echo host entry *.azurecr.io", script: "echo ${ACR_HOST1} >> /etc/hosts")
+                //sh(label: "echo host entry *.eastus2.data.azurecr.io", script: "echo ${ACR_HOST2} >> /etc/hosts")
+                //script.withCredentials([script.usernamePassword(credentialsId: ACR_REGISTRY_CRED, usernameVariable: 'LOGIN', passwordVariable: 'PASSWORD')]) {
+                 // script.sh 'helm repo add --username "$USER" --password "$PASSWORD" chartmuseum "http://$chartmuseumHostname:8080"'                  }
+                echo "----running copy command----"
+                sh(label: "skopeo copy image", script: 'skopeo copy --src-creds=${ODYSSEY_REGISTRY_CRED_USR}:${ODYSSEY_REGISTRY_CRED_PSW} --dest-creds=${ACR_REGISTRY_LOGIN}:${ACR_REGISTRY_TOKEN} docker://${ODYSSEY_REGISTRY}/${DOCKER_REPO}/${IMAGE_NAME_AND_TAG} docker://${ACR_REGISTRY}/${DOCKER_REPO}/${IMAGE_NAME_AND_TAG}')
+                echo "----exit and cleanup----"
+                sh(label: "exit", script: "exit")
+                sh(label: "prune", script: "docker system prune --force")
+                echo "----all done----"
+                echo "image $DOCKER_REPO/$IMAGE_NAME_AND_TAG copyed from $ODYSSEY_REGISTRY to $ACR_REGISTRY/$DOCKER_REPO/$IMAGE_NAME_AND_TAG"
+                echo "ACR image: $ACR_REGISTRY/$DOCKER_REPO/$IMAGE_NAME_AND_TAG"
+                echo "----end of copy to ACR----"
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                if(PROCEED.toBoolean()) {
+                    BUILD_STATUS = currentBuild.currentResult
+                    emailext subject: '${BUILD_STATUS} - $DEFAULT_SUBJECT', //just prefixing with status in front so it's easier to see
+                        body: '$DEFAULT_CONTENT',
+                        replyTo: '$DEFAULT_REPLYTO',
+                        to: EMAIL_NOTIFICATION
+                }
+            }
+        }
+    }
+
+}
+
+def getODYSSEY_REGISTRY() {
+        if ((params.ENV == 'dev') || (params.ENV == 'qa')) {
+            return "docker-dev.odyssey.apps.csintra.net"
+        } else {
+            return "docker.odyssey.apps.csintra.net"
+        }
+}

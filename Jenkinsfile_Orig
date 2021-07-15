@@ -1,0 +1,403 @@
+pipeline {
+    agent none
+
+    parameters {
+        choice(name: 'OVERRIDE_PROCEED', choices: ['default', 'true', 'false'], description: 'Override where job should proceed to execute')
+    }
+
+    environment {
+        PROCEED =  "${env.BRANCH_NAME == 'develop' ? true : false}"
+        EMAIL_NOTIFICATION="list.proplamc@credit-suisse.com,irina.tabachnik@credit-suisse.com"
+
+        // configuration
+        //COMMON_CONFIG = "config/envvars.groovy"
+        //ENV_CONFIG = "config/env/$AZURE_ENVIRONMENT/envvars.groovy"
+        //VARS_SCRIPT = "scripts/envVarsSupplier.groovy"
+        //UTILS_SCRIPT = "scripts/utils.groovy"
+
+        // credentials
+        ODYSSEY_DOCKER_CREDS = credentials("devops-docker-creds")
+        ODYSSEY_DOCKER_REGISTRY = "docker-dev.odyssey.apps.csintra.net"
+        LOCAL_DOCKER_IMAGE = "propl-entitlement-api"
+        REMOTE_DOCKER_IMAGE = "com/csg/ib/cts/proplng/images/base/propl-entitlement-api"
+        ACR_CREDS = credentials("devops-acr-creds")
+        ACR_REGISTRY = "proplngdev.azurecr.io"
+
+        AZURE_TENANT = "d0df3d96-c065-41c3-8c0b-5dcaa460ec33"
+        AZURE_CLI_CREDS = credentials("az-cli-sp-creds") //AZURE CLI SERVICE PRINCIPAL CREDENTIALS
+        AZURE_VAULT = "gm-rsd-dev-keyvault"
+        AZURE_VAULT_DEPLOY_CONTENT_TYPE = "api-entitlement-jenkins"
+        AZURE_P12_CERT_LIST = "server-cert" //comma separated
+        AZURE_PEM_CERT_LIST = "" //comma separated
+        AZURE_PFX_CERT_LIST = "" //comma separated
+
+        ARGO_URL = "https://ocp-3-us-pri-devit.caas.csintra.net"
+        ARGO_TOKEN = credentials("argo-token")
+        ARGO_HELM_RELEASE = "entitlements-api-argo"
+        ARGO_VALUES_FILENAME = "argo_values.yaml"
+        ARGO_AZURE_VAULT_DEPLOY_CONTENT_TYPE_PREFIX = "argo-"
+
+        ARO_URL = "https://api.arodev01.proplng.azure.hedani.net:6443"
+        ARO_TOKEN = credentials("aro-token")
+        ARO_HELM_RELEASE = "entitlements-api-aro"
+        ARO_VALUES_FILENAME = "aro_values.yaml"
+        ARO_AZURE_VAULT_DEPLOY_CONTENT_TYPE_PREFIX = "aro-"
+
+        HELM_REPO_URL = "https://odyssey.apps.csintra.net/docker/helm-dev"
+        HELM_REPO_NAME = "helm-dev"
+        HELM_CHART = "propl-entitlement-api-chart"
+        HELM_CHART_VER = "0.9.0"
+
+
+    }
+
+    options {
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Pre-Checkout') {
+            agent {
+                label 'docker'
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            steps {
+                script {
+                    echo PROCEED
+                    echo "${params.OVERRIDE_PROCEED}"
+                    if(!shouldProceed(params.OVERRIDE_PROCEED, PROCEED).toBoolean()) {
+                        echo('Aborting the build')
+                        currentBuild.result = 'ABORTED'
+                        error('you blew it')
+                    }
+
+                    sh(script: "printenv")
+                }
+            }
+        }
+        stage('Maven build') {
+            agent {
+                docker {
+                    image 'com/csg/dts/jenkins/jenkins-maven:1.0.5'
+                    label 'docker'
+                }
+            }
+            steps {
+                echo "---START BUILD---"
+                // sh(script: "printenv")
+                sh(script: "java -version")
+                sh(script: "ls -la")
+                // sh(script: "cat /usr/maven/latest/conf/settings.xml")
+                // sh(script: "${builder.username}")
+                sh(script: "mvn --version")
+                // sh(script: "mvn -s settings.xml help:effective-settings --debug")
+                // sh(script: "mvn -s settings.xml clean package --debug")
+                sh(script: "mvn -s settings.xml clean package")
+                //maven(command: "clean package -Dbuilder.username=${ODYSSEY_DOCKER_CREDS_USR} -Dbuilder.password=${ODYSSEY_DOCKER_CREDS_PSW}")
+                sh(script: "ls -l")
+                stash includes: 'app-jar/target/authapi.jar', name: 'artifacts'
+                stash includes: 'Dockerfile', name: 'dockerfile'
+                sh(script: "rm -r *")
+            }
+        }
+        stage('Build Image') {
+            agent {
+                label 'docker'
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            steps {
+                echo "----BUILDING DOCKER IMAGE----"
+                unstash 'artifacts'
+                unstash 'dockerfile'
+                //TODO: switch to runDocker once we figure out how to switch the credentials
+                sh(label: "docker build", script: "docker build -t $LOCAL_DOCKER_IMAGE .")
+                pushToOdyssey(ODYSSEY_DOCKER_REGISTRY, ODYSSEY_DOCKER_CREDS_USR, ODYSSEY_DOCKER_CREDS_PSW,
+                    LOCAL_DOCKER_IMAGE, "$ODYSSEY_DOCKER_REGISTRY/$REMOTE_DOCKER_IMAGE:$BUILD_ID" )
+                sh(label: "remove local image", script: "docker rmi ${LOCAL_DOCKER_IMAGE}")
+                sh(script: "rm -r *")
+            }
+        }
+        stage('Push Image to ACR') {
+            agent {
+                docker {
+                    image 'com/csg/dts/jenkins/jenkins-skopeo:1.1.2'
+                    label 'docker'
+                    args "--user root"
+                }
+            }
+            //environment {
+            //    HTTP_PROXY = "proxy.hedani.net:8080"
+            //    HTTPS_PROXY = "proxy.hedani.net:8080"
+            //}
+            options {
+                skipDefaultCheckout true
+            }
+            steps {
+                script {
+                    echo "--- Pushing image $ODYSSEY_DOCKER_REGISTRY/$REMOTE_DOCKER_IMAGE to $ACR_REGISTRY ---"
+
+                    sh(label: "add acr login entry to hosts file", script: "echo '10.32.213.12 proplngdev.azurecr.io' >> /etc/hosts")
+                    sh(label: "add acr data entry to hosts file", script: "echo '10.32.213.11 proplngdev.eastus2.data.azurecr.io' >> /etc/hosts")
+
+                    copyDockerImage(image: REMOTE_DOCKER_IMAGE,
+                        src: ODYSSEY_DOCKER_REGISTRY,
+                        dest: ACR_REGISTRY,
+                        tag: BUILD_ID,
+                        latest: true,
+                        srcUsr: ODYSSEY_DOCKER_CREDS_USR,
+                        srcPsw: ODYSSEY_DOCKER_CREDS_PSW,
+                        destUsr: ACR_CREDS_USR,
+                        destPsw: ACR_CREDS_PSW
+                    )
+                }
+            }
+        }
+        stage('Azure Keyvault ARGO') {
+            agent {
+                docker {
+                    image "docker.odyssey.apps.csintra.net/azure-cli:2.9.1"
+                    args "--user root"
+                }
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            environment {
+                HTTP_PROXY = "proxy.hedani.net:8080"
+                HTTPS_PROXY = "proxy.hedani.net:8080"
+            }
+            steps {
+                echo "***** calling Azure Cli"
+                // cleanWs()
+                sh(script: "ls -l")
+                sh(script: "rm -rf *")
+                script {
+                    sh(script: "az login --service-principal --username ${AZURE_CLI_CREDS_USR} --password ${AZURE_CLI_CREDS_PSW} --tenant ${AZURE_TENANT}")
+                    sh(script: 'pwd')
+                    sh(script: 'ls -l')
+                    sh(script: "mkdir overrides")
+                    deployContentType = "${ARGO_AZURE_VAULT_DEPLOY_CONTENT_TYPE_PREFIX}${AZURE_VAULT_DEPLOY_CONTENT_TYPE}"
+                    cmd = sh(script: "az keyvault secret list --vault-name \"${AZURE_VAULT}\" --query \"[?contentType=='${deployContentType}'].name\" --output tsv", returnStdout: true).trim()
+                    cmdList = cmd.split("\n")
+                    sh(label: "@echo off", script: "set +x")
+                    cmdList.each { key ->
+                        // echo "Getting Secret ${key}"
+                        // because azure only allow names with hyphen(-) and helm variables only allows underscores(_), we will translate hyphen to underscores
+                        // alternative would be to stop using azure vault and move to odyssey only for deployment
+                        underscoreKey = key.replaceAll('\\-','\\_').substring(ARGO_AZURE_VAULT_DEPLOY_CONTENT_TYPE_PREFIX.length())
+                        sh(label: "save secret ${key} (masked)", script: """
+                            set +x
+                            echo \"${underscoreKey}: `az keyvault secret show --vault-name \"${AZURE_VAULT}\" --query \"value\" --name \"${key}\"`\" >> overrides/argo-overrides.yaml
+                        """)
+                    }
+                    sh(script: "set -x")
+                    sh(script: "mkdir certs")
+                    /*
+                    ######################
+                    ########## FOR FUTURE REFERENCE ONCE WE FIGURE OUT CERTS, below command works and downloads a cert
+                    ######################
+                    if(env.AZURE_P12_CERT_LIST && !AZURE_P12_CERT_LIST.trim().equals("")) {
+                        AZURE_P12_CERT_LIST.split(",").each { certName ->
+                            sh(label: "Download Cert ${certName}", script: "az keyvault certificate download --vault-name \"${AZURE_VAULT}\" --name server-cert --file certs/${certName}.p12")
+                        }
+                    }
+                    if(env.AZURE_PEM_CERT_LIST && !AZURE_PEM_CERT_LIST.trim().equals("")) {
+                        AZURE_PEM_CERT_LIST.split(",").each { certName ->
+                            sh(label: "Download Cert ${certName}", script: "az keyvault certificate download --vault-name \"${AZURE_VAULT}\" --name server-cert --file certs/${certName}.pem")
+                        }
+                    }
+                    if(env.AZURE_PFX_CERT_LIST && !AZURE_PFX_CERT_LIST.trim().equals("")) {
+                        AZURE_PFX_CERT_LIST.split(",").each { certName ->
+                            sh(label: "Download Cert ${certName}", script: "az keyvault certificate download --vault-name \"${AZURE_VAULT}\" --name server-cert --file certs/${certName}.pfx")
+                        }
+                    }
+                    */
+                }
+                sh(label: "show overrides", script: "ls -l overrides")
+                sh(label: "show certs", script: "ls -l certs")
+                stash includes: 'overrides/**', name: 'argo-secrets'
+                sh(script: "rm -r *")
+            }
+        }
+        stage('Deploy to ARGO') {
+            agent {
+                docker {
+                    image 'com/csg/em/operational/oc-cli-helm:1.0.7'
+                    label 'docker'
+                    args "--user root"
+                }
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            environment {
+                TEMP_DIR = '/tmp/chart'
+                CHART_DIR = '${TEMP_DIR}/${HELM_CHART}'
+                ENVIRONMENT = 'dev'
+                VALUES_OVERRIDE = "${CHART_DIR}/overrides/${ENVIRONMENT}/${ARGO_VALUES_FILENAME}"
+            }
+            steps {
+                echo "--- Deploying to ARGO ---"
+
+                sh(label: "oc version", script: "oc version")
+                sh(label: "oc login", script: "oc login ${ARGO_URL} --token=${ARGO_TOKEN} --insecure-skip-tls-verify=true")
+                sh(label: "helm version", script: "helm version")
+                sh(label: "helm add repo", script: "helm repo add helm-dev ${HELM_REPO_URL} --username ${ODYSSEY_DOCKER_CREDS_USR} --password ${ODYSSEY_DOCKER_CREDS_PSW}")
+                sh(label: "Update helm repo", script: "helm repo update")
+                sh(label: "create temp dir", script: "mkdir ${TEMP_DIR}")
+                sh(label: "helm pull", script: "helm pull ${HELM_REPO_NAME}/${HELM_CHART} --version ${HELM_CHART_VER} -d ${TEMP_DIR} --untar")
+
+                unstash 'argo-secrets'
+                sh(script: "ls -lR")
+                // sh(label: 'move certs to helm folder', script: 'mv certs/* ${TEMP_DIR}/${HELM_CHART}/certs')
+
+                sh(label: "ls -l helm chart", script: "ls -l ${TEMP_DIR}/${HELM_CHART}")
+                sh(label: "helm deployment", script: "helm upgrade --install ${ARGO_HELM_RELEASE} ${CHART_DIR} -f ${VALUES_OVERRIDE} -f overrides/argo-overrides.yaml --version ${HELM_CHART_VER} --set image=${ODYSSEY_DOCKER_REGISTRY}/${REMOTE_DOCKER_IMAGE}:${BUILD_ID}")
+                sh(label: "oc logout", script: "oc logout")
+                sh(script: "rm -r ${TEMP_DIR}")
+                sh(script: "rm -r *")
+            }
+        }
+        stage('Azure Keyvault ARO') {
+            agent {
+                docker {
+                    image "docker.odyssey.apps.csintra.net/azure-cli:2.9.1"
+                    args "--user root"
+                }
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            environment {
+                HTTP_PROXY = "proxy.hedani.net:8080"
+                HTTPS_PROXY = "proxy.hedani.net:8080"
+            }
+            steps {
+                echo "***** calling Azure Cli"
+                // cleanWs()
+                sh(script: "ls -l")
+                sh(script: "rm -rf *")
+                script {
+                    sh(script: "az login --service-principal --username ${AZURE_CLI_CREDS_USR} --password ${AZURE_CLI_CREDS_PSW} --tenant ${AZURE_TENANT}")
+                    sh(script: 'pwd')
+                    sh(script: 'ls -l')
+                    sh(script: "mkdir overrides")
+                    deployContentType = "${ARO_AZURE_VAULT_DEPLOY_CONTENT_TYPE_PREFIX}${AZURE_VAULT_DEPLOY_CONTENT_TYPE}"
+                    cmd = sh(script: "az keyvault secret list --vault-name \"${AZURE_VAULT}\" --query \"[?contentType=='${deployContentType}'].name\" --output tsv", returnStdout: true).trim()
+                    cmdList = cmd.split("\n")
+                    sh(label: "@echo off", script: "set +x")
+                    cmdList.each { key ->
+                        // echo "Getting Secret ${key}"
+                        underscoreKey = key.replaceAll('\\-','\\_').substring(ARO_AZURE_VAULT_DEPLOY_CONTENT_TYPE_PREFIX.length())
+                        sh(label: 'save secret ${key} (masked)', script: """
+                            set +x
+                            echo \"${underscoreKey}: `az keyvault secret show --vault-name \"${AZURE_VAULT}\" --query \"value\" --name \"${key}\"`\" >> overrides/aro-overrides.yaml
+                        """)
+                    }
+                    sh(label: '@echo on', script: "set -x")
+                    sh(script: "mkdir certs")
+                    /*
+                    ######################
+                    ########## FOR FUTURE REFERENCE ONCE WE FIGURE OUT CERTS, below command works and downloads a cert
+                    ######################
+                    if(env.AZURE_P12_CERT_LIST && !AZURE_P12_CERT_LIST.trim().equals("")) {
+                        AZURE_P12_CERT_LIST.split(",").each { certName ->
+                            sh(label: "Download Cert ${certName}", script: "az keyvault certificate download --vault-name \"${AZURE_VAULT}\" --name server-cert --file certs/${certName}.p12")
+                        }
+                    }
+                    if(env.AZURE_PEM_CERT_LIST && !AZURE_PEM_CERT_LIST.trim().equals("")) {
+                        AZURE_PEM_CERT_LIST.split(",").each { certName ->
+                            sh(label: "Download Cert ${certName}", script: "az keyvault certificate download --vault-name \"${AZURE_VAULT}\" --name server-cert --file certs/${certName}.pem")
+                        }
+                    }
+                    if(env.AZURE_PFX_CERT_LIST && !AZURE_PFX_CERT_LIST.trim().equals("")) {
+                        AZURE_PFX_CERT_LIST.split(",").each { certName ->
+                            sh(label: "Download Cert ${certName}", script: "az keyvault certificate download --vault-name \"${AZURE_VAULT}\" --name server-cert --file certs/${certName}.pfx")
+                        }
+                    }
+                    */
+                }
+                sh(label: "show overrides", script: "ls -l overrides")
+                sh(label: "show certs", script: "ls -l certs")
+                stash includes: 'overrides/**', name: 'aro-secrets'
+                sh(script: "rm -r *")
+            }
+        }
+        stage('Deploy to ARO') {
+            agent {
+                docker {
+                    image 'com/csg/em/operational/oc-cli-helm:1.0.7'
+                    label 'docker'
+                    args "--user root"
+                }
+            }
+            environment {
+                TEMP_DIR = '/tmp/chart'
+                CHART_DIR = '${TEMP_DIR}/${HELM_CHART}'
+                ENVIRONMENT = 'dev'
+                VALUES_OVERRIDE = "${CHART_DIR}/overrides/${ENVIRONMENT}/${ARGO_VALUES_FILENAME}"
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            steps {
+                echo "--- Deploying to ARO ---"
+
+                sh(label: "oc version", script: "oc version")
+                sh(label: "oc login", script: "oc login ${ARO_URL} --token=${ARO_TOKEN} --insecure-skip-tls-verify=true")
+                sh(label: "helm version", script: "helm version")
+                sh(label: "helm add repo", script: "helm repo add helm-dev ${HELM_REPO_URL} --username ${ODYSSEY_DOCKER_CREDS_USR} --password ${ODYSSEY_DOCKER_CREDS_PSW}")
+                sh(label: "Update helm repo", script: "helm repo update")
+                sh(label: "create temp dir", script: "mkdir ${TEMP_DIR}")
+                sh(label: "helm pull", script: "helm pull ${HELM_REPO_NAME}/${HELM_CHART} --version ${HELM_CHART_VER} -d ${TEMP_DIR} --untar")
+
+                unstash 'aro-secrets'
+                sh(script: "ls -lR")
+
+                sh(label: "ls -l helm chart", script: "ls -l ${TEMP_DIR}/${HELM_CHART}")
+                sh(label: "helm deployment", script: "helm upgrade --install ${ARO_HELM_RELEASE} ${CHART_DIR} -f ${VALUES_OVERRIDE} -f overrides/aro-overrides.yaml --version ${HELM_CHART_VER} --set image=${ACR_REGISTRY}/${REMOTE_DOCKER_IMAGE}:${BUILD_ID}")
+                sh(label: "oc logout", script: "oc logout")
+                sh(script: "rm -r ${TEMP_DIR}")
+                sh(script: "rm -r *")
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+    //          if (currentBuild.currentResult == 'FAILURE') { // Other values: SUCCESS, UNSTABLE
+                    // Send an email only if the build status has changed from green/unstable to red
+
+                if(PROCEED.toBoolean()) {
+                    BUILD_STATUS = currentBuild.currentResult
+
+                    emailext subject: '${BUILD_STATUS} - $DEFAULT_SUBJECT', //just prefixing with status in front so it's easier to see
+                        body: '$DEFAULT_CONTENT',
+                        replyTo: '$DEFAULT_REPLYTO',
+                        to: EMAIL_NOTIFICATION
+                }
+    //          }
+            }
+        }
+    }
+}
+
+def pushToOdyssey(String registry,String user,String pass,String localImagePath,String odysseyImagePath) {
+    sh(label: "docker login", script: "docker login -u ${user} -p ${pass} ${registry}")
+    sh(label: "docker tag", script: "docker tag ${localImagePath} ${odysseyImagePath}")
+    sh(label: "docker push", script: "docker push ${odysseyImagePath}")
+    sh(label: "docker logout", script: "docker logout ${registry}")
+}
+
+def shouldProceed(String override, String proceed) {
+    if( override == 'default' ) {
+        return proceed
+    } else {
+        return override
+    }
+}
