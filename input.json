@@ -1,0 +1,5 @@
+{
+    "REGISTRY_URL": "https://dkadam.azurecr.io",
+    "CREDENTIALS_ID": "azure",
+    "LOCAL_IMAGE_NAME": "acrtest"
+}
